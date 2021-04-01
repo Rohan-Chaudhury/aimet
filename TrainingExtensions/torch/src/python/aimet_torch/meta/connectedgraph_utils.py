@@ -113,3 +113,26 @@ def create_connected_graph_with_input_shapes(model: torch.nn.Module, input_shape
     device = get_device(model)
     random_inputs = tuple([inp.to(device) for inp in random_inputs])
     return ConnectedGraph(model, random_inputs)
+
+
+def get_ops_with_missing_modules(model: torch.nn.Module, model_input: Union[torch.Tensor, Tuple]) -> List[str]:
+    """
+    Utility function to ensure that all connected graph ops of a certain type have associated modules
+    :param model: Pytorch model to create connected graph from
+    :param model_input: Example input to model.  Can be a single tensor or a list/tuple of input tensors
+    :return: List of op names with missing modules
+    """
+    try:
+        conn_graph = ConnectedGraph(model, model_input)
+    except:
+        logger.error('A connected graph failed to be built. This may prevent from AIMET features from being able to '
+                     'run on the model. Please address the errors shown.')
+        raise AssertionError
+
+    missing_modules = []
+    for op_name, op in conn_graph.get_all_ops().items():
+        if not op.get_module() and op.type not in ConnectedGraph.functional_ops:
+            missing_modules.append(op_name)
+
+
+    return missing_modules

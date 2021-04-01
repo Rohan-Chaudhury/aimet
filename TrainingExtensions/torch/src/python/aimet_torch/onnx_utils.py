@@ -39,9 +39,12 @@
 """ Utilities to load and save onnx models """
 
 from typing import Union, List, Tuple, Dict
+import os
+import copy
 
 import torch
 import torch.nn as nn
+import torch.onnx.symbolic_caffe2
 import onnx
 
 from aimet_common.utils import AimetLogger
@@ -66,18 +69,20 @@ map_torch_types_to_onnx = {
     nn.RNN:  ['RNN'],
     nn.LSTM: ['LSTM'],
     nn.GRU: ['GRU'],
-    nn.ConvTranspose2d: ['ConvTranpose'],
+    nn.ConvTranspose2d: ['ConvTranspose'],
     nn.Sigmoid: ['Sigmoid'],
+    nn.Upsample: ['Upsample'],
+    nn.PReLU: ['PRelu'],
     elementwise_ops.Add: ['Add'],
-    elementwise_ops.Subtract: ['Subtract'],
-    elementwise_ops.Multiply: ['Multiply'],
-    elementwise_ops.Divide: ['Divide'],
+    elementwise_ops.Subtract: ['Sub'],
+    elementwise_ops.Multiply: ['Mul'],
+    elementwise_ops.Divide: ['Div'],
     elementwise_ops.Concat: ['Concat']
 
 }
 
 # Define this as a list instead of tuple to allow for users to modify
-torch_types_to_ignore = [nn.Dropout, nn.Dropout2d, PassThroughOp]
+torch_types_to_ignore = [nn.Dropout, nn.Dropout2d, nn.Identity, PassThroughOp]
 torch_recurrent_modules = (nn.RNN, nn.LSTM, nn.GRU)
 
 # List of associations between onnx types and pytorch connected graph types.
@@ -122,6 +127,10 @@ class OnnxSaver:
         map_output_tensor_to_node, _ = cls.create_map_of_tensor_to_node(onnx_model)
 
         ordered_list_of_nodes = cls.find_ordered_list_of_onnx_nodes(map_output_tensor_to_node)
+
+        ordered_list_of_nodes = cls._filter_out_uninteresting_onnx_nodes(pytorch_model, dummy_input,
+                                                                         ordered_list_of_nodes,
+                                                                         os.path.dirname(onnx_model_path))
 
         # Find corresponding pytorch nodes for every ONNX node
         # and set the name of the ONNX nodes to the names of the corresponding PyTorch modules
@@ -180,6 +189,109 @@ class OnnxSaver:
                 ordered_nodes_no_duplicates.append(node)
 
         return ordered_nodes_no_duplicates
+
+    @classmethod
+    def _add_markers(cls, starting_module):
+        """Recursively add marker layers
+        """
+
+        class MarkerLayer(torch.nn.Module):
+            """
+            This is a temporary layer that in inserted next to a real layer to distinguish the real layer in the
+            exported ONNX format
+            """
+            def __init__(self, module):
+                super(MarkerLayer, self).__init__()
+                self.module = module
+
+            def forward(self, *x):
+                o = []
+                for i, t in enumerate(x):
+                    if i == 0:
+                        t = torch.quantize_per_tensor(t, 1, 0, torch.qint32)
+                        t = torch.dequantize(t)
+                    o.append(t)
+
+                x = self.module(*o)
+                if isinstance(x, torch.Tensor):
+                    x = torch.quantize_per_tensor(x, 2, 0, torch.qint32)
+                    x = torch.dequantize(x)
+                else:
+                    o = []
+                    for i, t in enumerate(x):
+                        if i == 0:
+                            t = torch.quantize_per_tensor(t, 1, 0, torch.qint32)
+                            t = torch.dequantize(t)
+                        o.append(t)
+                    x = tuple(o)
+
+                return x
+
+        for module_name, module_ref in starting_module.named_children():
+
+            if aimet_torch.utils.is_leaf_module(module_ref):
+                marker_layer = MarkerLayer(module_ref)
+                setattr(starting_module, module_name, marker_layer)
+
+            # recursively call children modules
+            else:
+                cls._add_markers(module_ref)
+
+    @classmethod
+    def _filter_out_uninteresting_onnx_nodes(cls, pt_model, dummy_input, onnx_ordered_node_list, working_dir):
+
+        model = copy.deepcopy(pt_model).cpu()
+        cls._add_markers(model)
+
+        torch.onnx.symbolic_caffe2.register_quantized_ops('caffe2', 9)
+
+        temp_file = os.path.join(working_dir, 'temp_onnx_model_with_markers.onnx')
+        torch.onnx.export(model, dummy_input, temp_file)
+
+        # Parse the ONNX model and create mapping from input and output tensors to corresponding nodes
+        map_output_tensor_to_node_marker_model, _ = cls.create_map_of_tensor_to_node(onnx.load(temp_file))
+        ordered_list_of_nodes_marker_model = cls.find_ordered_list_of_onnx_nodes(
+            map_output_tensor_to_node_marker_model)
+
+        skip_info = []
+        node_iter = iter(ordered_list_of_nodes_marker_model)
+        while node_iter:
+
+            # Find the next block of interest
+            node = next(node_iter, None)
+            if node is None:
+                break
+            while node.op_type != 'Int8Quantize':
+                skip_info.append((node.op_type, True))
+                node = next(node_iter, None)
+                if node is None:
+                    break
+            if node is None:
+                break
+
+            # Skip the marker nodes
+            node = next(node_iter)
+            assert node.op_type == 'Int8Dequantize'
+
+            # Glob the block of nodes (these are the nodes corresponding to the pytorch modules)
+            node = next(node_iter)
+            while node.op_type != 'Int8Quantize':
+                skip_info.append((node.op_type, False))
+                node = next(node_iter)
+
+            # Skip the marker nodes
+            node = next(node_iter)
+            assert node.op_type == 'Int8Dequantize'
+
+        # Use the skip list to filter out the original list of onnx nodes
+        assert len(skip_info) == len(onnx_ordered_node_list)
+        filtered_node_list = []
+        for index, node in enumerate(onnx_ordered_node_list):
+            assert node.op_type == skip_info[index][0]
+            if not skip_info[index][1]:
+                filtered_node_list.append(node)
+
+        return filtered_node_list
 
     @staticmethod
     def get_num_onnx_nodes_to_map(module: nn.Module):

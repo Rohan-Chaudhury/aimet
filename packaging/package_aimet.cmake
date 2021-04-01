@@ -44,7 +44,15 @@ configure_file("${SOURCE_DIR}/packaging/requirements.txt" "${CMAKE_BINARY_DIR}/p
 configure_file("${SOURCE_DIR}/packaging/INSTALL.txt" "${CMAKE_BINARY_DIR}/packaging/INSTALL.txt" COPYONLY)
 configure_file("${SOURCE_DIR}/packaging/setup_cfg.py" "${CMAKE_BINARY_DIR}/packaging/setup_cfg.py" COPYONLY)
 
-set(package_name_list aimet aimet_common aimet_torch aimet_tensorflow)
+# Setup the package array list
+set(package_name_list aimet_common)
+if(ENABLE_TENSORFLOW)
+  list(APPEND package_name_list aimet_tensorflow)
+endif()
+if(ENABLE_TORCH)
+  list(APPEND package_name_list aimet_torch)
+endif()
+list(APPEND package_name_list aimet)
 
 #to create whl packages, copying set up files, and related code to build directory.
 #these copied files would be input to the setuptools
@@ -63,6 +71,9 @@ foreach(package ${package_name_list})
     configure_file("${SOURCE_DIR}/packaging/requirements.txt" "${CMAKE_BINARY_DIR}/packaging/${package}/bin/" COPYONLY)
     configure_file("${SOURCE_DIR}/packaging/packages_common.txt" "${CMAKE_BINARY_DIR}/packaging/${package}/bin/" COPYONLY)
     configure_file("${SOURCE_DIR}/packaging/packages_gpu.txt" "${CMAKE_BINARY_DIR}/packaging/${package}/bin/" COPYONLY)
+    if(EXISTS "${SOURCE_DIR}/packaging/LICENSE.pdf")
+      configure_file("${SOURCE_DIR}/packaging/LICENSE.pdf" "${CMAKE_BINARY_DIR}/packaging/${package}/bin/" COPYONLY)
+    endif()
     configure_file("${SOURCE_DIR}/packaging/INSTALL.txt" "${CMAKE_BINARY_DIR}/packaging/${package}/bin/" COPYONLY)
     configure_file("${SOURCE_DIR}/packaging/envsetup.sh" "${CMAKE_BINARY_DIR}/packaging/${package}/bin/" COPYONLY)
   elseif("${package}" STREQUAL "aimet")

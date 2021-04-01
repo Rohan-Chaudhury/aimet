@@ -125,9 +125,11 @@ class QcQuantizeRecurrent(torch.nn.Module):
     """
     # pylint: disable = too-many-arguments
     # pylint: disable = too-many-instance-attributes
+    # pylint: disable=unused-argument
     def __init__(self, module_to_quantize: Union[torch.nn.RNN, torch.nn.LSTM, torch.nn.GRU],
                  weight_bw: int, activation_bw: int, round_mode: str,
-                 quant_scheme: Union[QuantScheme, libpymo.QuantizationMode], is_symmetric: bool = False):
+                 quant_scheme: Union[QuantScheme, libpymo.QuantizationMode], is_symmetric: bool = False,
+                 num_inputs=1, num_outputs=1):
         """
         Constructor
         :param module_to_quantize: Module that needs to be quantized
@@ -136,10 +138,12 @@ class QcQuantizeRecurrent(torch.nn.Module):
         :param round_mode: Rounding mode (e.g. Nearest)
         :param quant_scheme: Quantization scheme (e.g. TF Enhanced)
         :param is_symmetric: Symmetric or asymmetric quantization
+        :param num_inputs: Number of inputs for this module (Added to keep a common interface with QcQuantizeWrapper)
+        :param num_outputs: Number of outputs for this module (Added to keep a common interface with QcQuantizeWrapper)
         """
         super(QcQuantizeRecurrent, self).__init__()
 
-        self._mode = QcQuantizeOpMode.PASSTHROUGH
+        self._mode = QcQuantizeOpMode.ANALYSIS
         # clone parameter
         self._clone_module_params(module_to_quantize)
         self.module_to_quantize = module_to_quantize
@@ -528,19 +532,15 @@ class QcQuantizeRecurrent(torch.nn.Module):
         group_quantizers = self._grouped_quantizers.values()
         for quantizer in group_quantizers:
             quantizer.reset_encoding_stats()
-            quantizer.encoding = None
         for param_quantizer in self._param_quantizers.values():
             if param_quantizer not in group_quantizers:
                 param_quantizer.reset_encoding_stats()
-                param_quantizer.encoding = None
         for input_quantizer in self._input_quantizers.values():
             if input_quantizer not in group_quantizers:
                 input_quantizer.reset_encoding_stats()
-                input_quantizer.encoding = None
         for output_quantizer in self._output_quantizers.values():
             if output_quantizer not in group_quantizers:
                 output_quantizer.reset_encoding_stats()
-                output_quantizer.encoding = None
 
     def update_params(self):
         """

@@ -143,19 +143,24 @@ if [ ${dry_run} -eq 0 ]; then
 	set -x
 fi
 
-
-
 timestamp=$(date +%Y-%m-%d_%H-%M-%S)
-
 
 if [ ! -d "../aimet" ] && [ ! -d "../aimet-main" ]; then
    echo -e "ERROR: Not in the correct directory!"
    exit 3
 fi
 
+# Select the docker file based on the build variant
+if [ -n "$AIMET_VARIANT" ]; then
+    docker_file="${scriptPath}/Jenkins/Dockerfile.${AIMET_VARIANT}"
+    docker_image_name="aimet-dev-docker:${AIMET_VARIANT}"
+else
+    docker_file="${scriptPath}/Jenkins/Dockerfile"
+    docker_image_name="aimet-dev-docker:latest"
+fi
+
 echo -e "Building docker image${loading_symbol} \n"
-docker_image_name="aimet-dev-docker:latest"
-DOCKER_BUILD_CMD="docker build -t ${docker_image_name} -f ${scriptPath}/Jenkins/Dockerfile ."
+DOCKER_BUILD_CMD="docker build -t ${docker_image_name} -f ${docker_file} ."
 if [ $interactive_mode -eq 1 ] && [ $dry_run -eq 1 ]; then
 	echo ${DOCKER_BUILD_CMD}
 	echo
@@ -164,12 +169,23 @@ else
 fi
 
 if [[ -z "${BUILD_NUMBER}" ]]; then
-     results_path=${outputRootFolder}/buildntest_results/$timestamp
-     docker_container_name=aimet-dev_${USER}_${timestamp}
+    # If invoked from command line by user, use a timestamp suffix
+    results_path=${outputRootFolder}/buildntest_results/$timestamp
+    docker_container_name=aimet-dev_${USER}_${timestamp}
+    # If this is a variant, then append the variant string as suffix
+    if [ -n "$AIMET_VARIANT" ]; then
+        docker_container_name="${docker_container_name}_${AIMET_VARIANT}"
+        results_path=${results_path}_${AIMET_VARIANT}
+    fi
 else
-     results_path=${outputRootFolder}/buildntest_results
-     docker_container_name=aimet-dev_${USER}
+    # If invoked from jenkins, then do NOT add a timestamp suffix
+    results_path=${outputRootFolder}/buildntest_results
+    docker_container_name=aimet-dev_${USER}
 fi
+
+# Add desired output folder to the options string
+options_string+=" -o ${results_path}"
+
 rm -rf {results_path} | true
 mkdir -p ${results_path}
 
@@ -185,23 +201,29 @@ else
    docker_add_vol_mount+=${scriptPath}
 fi
 
-#Check if and which version of nvidia docker is present
+# Check if and which version of nvidia docker is present
 set +e
 DOCKER_RUN_PREFIX="docker run"
 dpkg -s nvidia-container-toolkit > /dev/null 2>&1
 NVIDIA_CONTAINER_TOOKIT_RC=$?
 dpkg -s nvidia-docker > /dev/null 2>&1
 NVIDIA_DOCKER_RC=$?
+dpkg -s nvidia-docker2 > /dev/null 2>&1
+NVIDIA_DOCKER_RC2=$?
 set -e
 
-if [ $NVIDIA_CONTAINER_TOOKIT_RC -eq 0 ]
-then
-    DOCKER_RUN_PREFIX="docker run --gpus all"
-elif [ $NVIDIA_DOCKER_RC -eq 0 ]
-then
+if [ -n "$AIMET_VARIANT" ] && [[ "$AIMET_VARIANT" == *"cpu"* ]]; then
+    echo "Running docker in CPU mode..."
+    DOCKER_RUN_PREFIX="docker run"
+elif [ $NVIDIA_DOCKER_RC -eq 0 ] || [ $NVIDIA_DOCKER_RC2 -eq 0 ]; then
+    echo "Running docker in GPU mode using nvidia-docker..."
     DOCKER_RUN_PREFIX="nvidia-docker run"
+elif [ $NVIDIA_CONTAINER_TOOKIT_RC -eq 0 ]; then
+    echo "Running docker in GPU mode using nvidia-container-toolkit..."
+    DOCKER_RUN_PREFIX="docker run --gpus all"
 else
-    echo "WARNING: No nvidia support detected! Unit tests might fail due to GPU dependencies."
+    echo "ERROR: You requested GPU mode, but no nvidia support was detected!"
+    exit 3
 fi
 
 echo -e "Starting docker container${loading_symbol} \n"

@@ -6,6 +6,12 @@
 AIMET PyTorch Quantization SIM API
 ==================================
 
+AIMET Quantization Sim requires the model definitions to use certain constructs and avoid others. These constraints are
+described in detail :ref:`here<api-torch-model-validator>`.
+
+AIMET also includes a Model Validator tool to allow the users to check their model definition and find constructs that
+might need to be replaced. Please see the API and usage examples for this tool also on the same page.
+
 Top-level API
 =============
 
@@ -32,6 +38,10 @@ Top-level API
 **The following API can be used to Export the Model to target**
 
 .. automethod:: aimet_torch.quantsim.QuantizationSimModel.export
+
+|
+
+Encoding format is described in the :ref:`Quantization Encoding Specification<api-quantization-encoding-spec>`
 
 |
 

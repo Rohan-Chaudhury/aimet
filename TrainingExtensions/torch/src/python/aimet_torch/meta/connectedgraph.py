@@ -131,7 +131,6 @@ class ConnectedGraph(AimetCommonConnectedGraph):
         with torch.no_grad():
             self._construct_graph(model, model_input)
 
-        self._validate_op_modules()
         # Maps pytorch modules to connected graph ops
         self._module_to_op_dict = _create_module_to_op_dict(self.ordered_ops)
 
@@ -170,6 +169,7 @@ class ConnectedGraph(AimetCommonConnectedGraph):
         'slice',
         'select',
         'unsqueeze',
+        'randn',
         'Split'
     }
 
@@ -555,14 +555,14 @@ class ConnectedGraph(AimetCommonConnectedGraph):
         :param output_map: Mapping between higher level connections with corresponding lower level recursive
             connections. Only the base level connections carry shape information.
         """
-        _handle_ir_nodes_of_interest(ir_nodes_list, passthrough_types, input_types_to_ignore)
+        self._handle_ir_nodes_of_interest(ir_nodes_list, passthrough_types, input_types_to_ignore)
         filtered_ir_nodes = [ir_node for ir_node in ir_nodes_list if ir_node.node_type not in ['TupleConstruct',
                                                                                                'TupleUnpack',
                                                                                                'ListUnpack',
                                                                                                'ListConstruct']
                              and ir_node.node_type not in input_types_to_ignore
                              and ir_node.node_type not in passthrough_types]
-        connections_to_nodes_dict = _create_connections_to_ir_nodes_dict(filtered_ir_nodes)
+        connections_to_nodes_dict = self._create_connections_to_ir_nodes_dict(filtered_ir_nodes)
         ir_node_to_op_dict = self._create_ops_from_ir_nodes_list(filtered_ir_nodes, module_tensor_shapes_map)
         self._create_products_from_connections(connections_to_nodes_dict, ir_node_to_op_dict, output_map,
                                                input_types_to_ignore)
@@ -652,22 +652,23 @@ class ConnectedGraph(AimetCommonConnectedGraph):
         """
         for op in self._ops.values():
             module = op.get_module()
-            name = self._module_to_name.get(module, None)
-            if op.type in ['convolution', 'batch_norm', 'addmm', 'matmul']:
-                if module.weight is not None:
-                    product_name = name + '.weight'
-                    self._create_and_add_param_product_if_not_exists(op, product_name, list(module.weight.shape))
-                if module.bias is not None:
-                    product_name = name + '.bias'
-                    self._create_and_add_param_product_if_not_exists(op, product_name, list(module.bias.shape))
-            if op.type == 'batch_norm':
-                # If batch_norm, fill in rest of bn params
-                if module.running_mean is not None:
-                    product_name = name + '.running_mean'
-                    self._create_and_add_param_product_if_not_exists(op, product_name, list(module.running_mean.shape))
-                if module.running_var is not None:
-                    product_name = name + '.running_var'
-                    self._create_and_add_param_product_if_not_exists(op, product_name, list(module.running_var.shape))
+            if module is not None:
+                name = self._module_to_name.get(module, None)
+                if op.type in ['convolution', 'batch_norm', 'addmm', 'matmul']:
+                    if module.weight is not None:
+                        product_name = name + '.weight'
+                        self._create_and_add_param_product_if_not_exists(op, product_name, list(module.weight.shape))
+                    if module.bias is not None:
+                        product_name = name + '.bias'
+                        self._create_and_add_param_product_if_not_exists(op, product_name, list(module.bias.shape))
+                if op.type == 'batch_norm':
+                    # If batch_norm, fill in rest of bn params
+                    if module.running_mean is not None:
+                        product_name = name + '.running_mean'
+                        self._create_and_add_param_product_if_not_exists(op, product_name, list(module.running_mean.shape))
+                    if module.running_var is not None:
+                        product_name = name + '.running_var'
+                        self._create_and_add_param_product_if_not_exists(op, product_name, list(module.running_var.shape))
 
     def _create_and_add_param_product_if_not_exists(self, op: Op, product_name: str, shape: List[int]):
         """
@@ -885,26 +886,55 @@ class ConnectedGraph(AimetCommonConnectedGraph):
                          split_op_product.name, input_product_index)
             consumer_index += 1
 
-    def _validate_op_modules(self):
+    def _create_connections_to_ir_nodes_dict(self, ir_nodes_list: List[IrNode]) -> ConnectionsToIrDictType:
         """
-        Utility function to ensure that all connected graph ops of a certain type have associated modules
+        Create a mapping from connections found in torch graph to input and output IrNodes. Each connection will have one
+        input and zero or more outputs IrNodes.
+        :param ir_nodes_list: List of IrNodes to extract connections information from
+        :return: Dictionary mapping connections to input ir_node and output ir_nodes
         """
-        missing_modules = []
-        for op_name, op in self.get_all_ops().items():
-            if not op.get_module() and op.type not in self.functional_ops:
-                missing_modules.append(op_name)
-        if missing_modules:
-            # TODO: replace with logger.error and assertion after rewriting unit tests to avoid using built in vgg,
-            #  resnet, and inception models (since they use functionals in their models)
-            logger.warning('Ops with missing modules: %s\n'
-                           'This can be due to several reasons:\n'
-                           '1. There is no mapping for the op in ConnectedGraph.op_type_map. Add a mapping for '
-                           'ConnectedGraph to recognize and be able to map the op.\n'
-                           '2. The op is defined as a functional in the forward function, instead of as a class '
-                           'module. Redefine the op as a class module if possible. Else, check 3.\n'
-                           '3. This op is one that cannot be defined as a class module, but has not been added to '
-                           'ConnectedGraph.functional_ops. Add to continue.'
-                           , missing_modules)
+        connections_to_ir_nodes_dict = {}
+        for ir_node in ir_nodes_list:
+            node_inputs = _flatten_lists(ir_node.inputs)
+            node_outputs = _flatten_lists(ir_node.outputs)
+            for inp in node_inputs:
+                if inp in connections_to_ir_nodes_dict:
+                    connections_to_ir_nodes_dict[inp][1].append(ir_node)
+                else:
+                    connections_to_ir_nodes_dict[inp] = [None, [ir_node]]
+            for output in node_outputs:
+                if output in connections_to_ir_nodes_dict:
+                    if connections_to_ir_nodes_dict[output][0] is not None:
+                        inp_op_name = None
+                        if connections_to_ir_nodes_dict[output][0].module is not None:
+                            inp_op_name = self._module_to_name[connections_to_ir_nodes_dict[output][0].module]
+                        logger.error('Input of %s with name %s already exists. Ensure that no modules are being reused '
+                                     'in the model.', output, inp_op_name)
+                        raise AssertionError
+                    connections_to_ir_nodes_dict[output][0] = ir_node
+                else:
+                    connections_to_ir_nodes_dict[output] = [ir_node, []]
+        return connections_to_ir_nodes_dict
+
+    def _handle_ir_nodes_of_interest(self, ir_nodes_list: List[IrNode], passthrough_ops: List[str],
+                                     input_ops_to_ignore: List[str]):
+        """
+        Update input and output connections of certain ir_nodes in ir_nodes_list (Tuple/ListConstructs, passthrough,
+        input ops)
+        :param ir_nodes_list: List of ir_nodes to update connections for
+        :param passthrough_ops: List of op types to treat as passthrough
+        :param input_ops_to_ignore: List of input op types to ignore
+        """
+        connections_to_ir_nodes_dict = self._create_connections_to_ir_nodes_dict(ir_nodes_list)
+        for ir_node in ir_nodes_list:
+            if ir_node.node_type in ['TupleConstruct', 'ListConstruct']:
+                _handle_tuple_and_list_construct_ir_node(ir_node, connections_to_ir_nodes_dict)
+            elif ir_node.node_type in ['TupleUnpack', 'ListUnpack']:
+                _handle_tuple_unpack_ir_node(ir_node, connections_to_ir_nodes_dict)
+            elif ir_node.node_type in passthrough_ops:
+                _handle_passthrough_ir_node(ir_node, connections_to_ir_nodes_dict)
+            elif ir_node.node_type in input_ops_to_ignore:
+                _handle_input_ir_node_to_ignore(ir_node, connections_to_ir_nodes_dict)
 
 
 def _create_module_to_op_dict(ops: List[Op]) -> Dict[torch.nn.Module, Op]:
@@ -929,52 +959,6 @@ def _fill_groups_info(op: Op, module: torch.nn.Module):
 
     if op.type in 'convolution':
         op.groups = module.groups
-
-
-def _create_connections_to_ir_nodes_dict(ir_nodes_list: List[IrNode]) -> ConnectionsToIrDictType:
-    """
-    Create a mapping from connections found in torch graph to input and output IrNodes. Each connection will have one
-    input and zero or more outputs IrNodes.
-    :param ir_nodes_list: List of IrNodes to extract connections information from
-    :return: Dictionary mapping connections to input ir_node and output ir_nodes
-    """
-    connections_to_ir_nodes_dict = {}
-    for ir_node in ir_nodes_list:
-        node_inputs = _flatten_lists(ir_node.inputs)
-        node_outputs = _flatten_lists(ir_node.outputs)
-        for inp in node_inputs:
-            if inp in connections_to_ir_nodes_dict:
-                connections_to_ir_nodes_dict[inp][1].append(ir_node)
-            else:
-                connections_to_ir_nodes_dict[inp] = [None, [ir_node]]
-        for output in node_outputs:
-            if output in connections_to_ir_nodes_dict:
-                assert connections_to_ir_nodes_dict[output][0] is None
-                connections_to_ir_nodes_dict[output][0] = ir_node
-            else:
-                connections_to_ir_nodes_dict[output] = [ir_node, []]
-    return connections_to_ir_nodes_dict
-
-
-def _handle_ir_nodes_of_interest(ir_nodes_list: List[IrNode], passthrough_ops: List[str],
-                                 input_ops_to_ignore: List[str]):
-    """
-    Update input and output connections of certain ir_nodes in ir_nodes_list (Tuple/ListConstructs, passthrough,
-    input ops)
-    :param ir_nodes_list: List of ir_nodes to update connections for
-    :param passthrough_ops: List of op types to treat as passthrough
-    :param input_ops_to_ignore: List of input op types to ignore
-    """
-    connections_to_ir_nodes_dict = _create_connections_to_ir_nodes_dict(ir_nodes_list)
-    for ir_node in ir_nodes_list:
-        if ir_node.node_type in ['TupleConstruct', 'ListConstruct']:
-            _handle_tuple_and_list_construct_ir_node(ir_node, connections_to_ir_nodes_dict)
-        elif ir_node.node_type in ['TupleUnpack', 'ListUnpack']:
-            _handle_tuple_unpack_ir_node(ir_node, connections_to_ir_nodes_dict)
-        elif ir_node.node_type in passthrough_ops:
-            _handle_passthrough_ir_node(ir_node, connections_to_ir_nodes_dict)
-        elif ir_node.node_type in input_ops_to_ignore:
-            _handle_input_ir_node_to_ignore(ir_node, connections_to_ir_nodes_dict)
 
 
 def _handle_tuple_and_list_construct_ir_node(ir_node: IrNode, connections_to_ir_nodes_dict: ConnectionsToIrDictType):

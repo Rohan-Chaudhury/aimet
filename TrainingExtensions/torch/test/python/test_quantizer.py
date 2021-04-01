@@ -42,6 +42,8 @@ import torch
 import torch.nn as nn
 import json as json
 import os
+import yaml
+import onnx
 
 
 from torchvision import models
@@ -53,6 +55,7 @@ from aimet_torch.qc_quantize_recurrent import QcQuantizeRecurrent
 from aimet_torch.quantsim import QuantizationSimModel
 from aimet_torch.quantsim_straight_through_grad import compute_dloss_by_dx
 from aimet_torch.defs import PassThroughOp
+from aimet_torch import utils, elementwise_ops
 
 from aimet_torch.qc_quantize_op import QcQuantizeWrapper, QcQuantizeStandalone, MAP_ROUND_MODE_TO_PYMO, \
     MAP_QUANT_SCHEME_TO_PYMO, QcPostTrainingWrapper, QcQuantizeOpMode
@@ -205,11 +208,50 @@ class ModelWithTwoInputs(nn.Module):
         return self.softmax(x)
 
 
+class ModelWithTwoInputsOneToAdd(nn.Module):
+
+    def __init__(self):
+        super(ModelWithTwoInputsOneToAdd, self).__init__()
+        self.conv1_a = nn.Conv2d(1, 10, kernel_size=5)
+        self.maxpool1_a = nn.MaxPool2d(2)
+        self.relu1_a = nn.ReLU()
+
+        self.conv1_b = nn.Conv2d(10, 10, kernel_size=5)
+        self.maxpool1_b = nn.MaxPool2d(2)
+        self.relu1_b = nn.ReLU()
+
+        self.add = elementwise_ops.Add()
+
+        self.conv2 = nn.Conv2d(10, 20, kernel_size=5)
+        self.maxpool2 = nn.MaxPool2d(2)
+        self.relu2 = nn.ReLU()
+
+        self.fc1 = nn.Linear(320, 50)
+        self.relu3 = nn.ReLU()
+        self.dropout = nn.Dropout()
+        self.fc2 = nn.Linear(50, 10)
+
+        self.softmax = nn.LogSoftmax(dim=1)
+
+    def forward(self, x1, x2):
+        x1 = self.relu1_a(self.maxpool1_a(self.conv1_a(x1)))
+        x1 = self.relu1_b(self.maxpool1_b(self.conv1_b(x1)))
+
+        x = self.add(x1, x2)
+
+        x = self.relu2(self.maxpool2(self.conv2(x)))
+        x = x.view(-1, 320)
+        x = self.relu3(self.fc1(x))
+        x = self.dropout(x)
+        x = self.fc2(x)
+        return self.softmax(x)
+
+
 class TestQuantizationSim(unittest.TestCase):
     def test_is_leaf_module_positive(self):
         """With an actual leaf module"""
         conv1 = nn.Conv2d(1, 10, 5)
-        self.assertTrue(QuantizationSimModel._is_leaf_module(conv1))
+        self.assertTrue(utils.is_leaf_module(conv1))
 
     # -------------------------------------------
     def test_is_leaf_module_negative(self):
@@ -224,7 +266,7 @@ class TestQuantizationSim(unittest.TestCase):
         net = Net()
         model = net.to(torch.device('cpu'))
 
-        self.assertFalse(QuantizationSimModel._is_leaf_module(model))
+        self.assertFalse(utils.is_leaf_module(model))
 
     # -------------------------------------------------------------
     def test_is_quantizable_module_positive(self):
@@ -326,7 +368,7 @@ class TestQuantizationSim(unittest.TestCase):
         sim = QuantizationSimModel(model, dummy_input=torch.rand(1, 1, 12, 12))
 
         # Add wrappers again, expect to be a nop
-        sim._add_quantization_wrappers(model)
+        sim._add_quantization_wrappers(model, num_inout_tensors={})
 
         self.verify_quantization_wrappers(model, sim.model)
 
@@ -507,42 +549,83 @@ class TestQuantizationSim(unittest.TestCase):
     def test_model_with_two_inputs(self):
         """Model with more than 1 input"""
 
+        dummy_input=(torch.rand(32, 1, 28, 28), torch.rand(32, 1, 28, 28))
+
         def forward_pass(model, args):
             model.eval()
             with torch.no_grad():
-                model(torch.randn((32, 1, 28, 28)), torch.randn(32, 1, 28, 28))
+                model(*dummy_input)
 
         model = ModelWithTwoInputs()
 
-        sim = QuantizationSimModel(model, dummy_input=(torch.rand(32, 1, 28, 28), torch.rand(32, 1, 28, 28)))
+        sim = QuantizationSimModel(model, dummy_input=dummy_input)
 
         # Quantize
         sim.compute_encodings(forward_pass, None)
 
         # save encodings
-        sim.export('./data/', 'two_input_model', input_shape=[(1, 1, 28, 28), (1, 1, 28, 28)])
+        sim.export('./data/', 'two_input_model', dummy_input)
 
     # -------------------------------------------
+
+    def test_model_with_two_inputs_one_to_add(self):
+        """Model with more than 1 input"""
+
+        dummy_input = (torch.rand(32, 1, 100, 100), torch.rand(32, 10, 22, 22))
+
+        def forward_pass(sim_model, _):
+            sim_model.eval()
+            with torch.no_grad():
+                sim_model(*dummy_input)
+
+        model = ModelWithTwoInputsOneToAdd()
+
+        sim = QuantizationSimModel(model, dummy_input=dummy_input)
+        self.assertEqual(2, len(sim.model.add.input_quantizers))
+        self.assertFalse(sim.model.add.input_quantizers[0].enabled)
+        self.assertFalse(sim.model.add.input_quantizers[1].enabled)
+
+        sim.model.add.input_quantizers[1].enabled = True
+
+        # Quantize
+        sim.compute_encodings(forward_pass, None)
+        print(sim)
+
+        # save encodings
+        sim.export('./data/', 'two_input_model_one_with_add', dummy_input)
+        onnx_model = onnx_model = onnx.load('./data/two_input_model_one_with_add.onnx')
+        for node in onnx_model.graph.node:
+            if node.name == 'add':
+                break
+        self.assertEqual(2, len(node.input))
+        model_input_tensor = node.input[1]
+
+        with open("./data/two_input_model_one_with_add.encodings", "r") as encodings_file:
+            encodings = json.load(encodings_file)
+
+        self.assertTrue(model_input_tensor in encodings['activation_encodings'])
+        enc = encodings['activation_encodings'][model_input_tensor]
+        print(enc)
 
     def test_export_unified_encoding_format(self):
         """ test export functionality on ResNet18 """
 
         resnet18 = models.resnet18()
         resnet18.eval()
-        input_shapes = (1, 3, 224, 224)
+        dummy_input = torch.randn(1, 3, 224, 224)
 
         # Get Dict mapping node name to the input and output names
-        sim = QuantizationSimModel(resnet18, dummy_input=torch.rand(1, 3, 224, 224))
+        sim = QuantizationSimModel(resnet18, dummy_input=dummy_input)
 
         def forward_pass(model, args):
             model.eval()
             with torch.no_grad():
-                model(torch.randn(1, 3, 224, 224))
+                model(dummy_input)
 
         # Quantize
         sim.compute_encodings(forward_pass, None)
 
-        sim.export('./data/', 'resnet18', input_shape=(1, 3, 224, 224))
+        sim.export('./data/', 'resnet18', dummy_input)
         with open('./data/resnet18.encodings') as json_file:
             encoding_data = json.load(json_file)
             print(encoding_data)
@@ -561,8 +644,10 @@ class TestQuantizationSim(unittest.TestCase):
         resnet50 = models.resnet50()
         resnet50.eval()
 
+        dummy_input = torch.randn(1, 3, 224, 224)
+
         # Get Dict mapping node name to the input and output names
-        sim = QuantizationSimModel(resnet50, input_shapes=(1, 3, 224, 224))
+        sim = QuantizationSimModel(resnet50, dummy_input)
 
         def forward_pass(model, args):
             model.eval()
@@ -572,7 +657,7 @@ class TestQuantizationSim(unittest.TestCase):
         # Quantize
         sim.compute_encodings(forward_pass, None)
 
-        sim.export('./data/', 'resnet50', input_shape=(1, 3, 224, 224), use_torch_script_graph=True)
+        sim.export('./data/', 'resnet50', dummy_input, use_torch_script_graph=True)
         with open('./data/resnet50.encodings') as json_file:
             encoding_data = json.load(json_file)
 
@@ -583,18 +668,33 @@ class TestQuantizationSim(unittest.TestCase):
         param_keys = list(encoding_data["param_encodings"].keys())
         self.assertTrue(param_keys[2] == "conv1.weight")
         self.assertTrue(isinstance(encoding_data["param_encodings"]["conv1.weight"], list))
+    
+        with open('./data/resnet50.encodings.yaml') as yaml_file:
+             encoding_data = yaml.load(yaml_file, Loader=yaml.FullLoader)
+ 
+        activation_keys = list(encoding_data["activation_encodings"].keys())
+        self.assertEqual(activation_keys[0], "1067")
+        self.assertTrue(isinstance(encoding_data["activation_encodings"]["1067"], list))
+ 
+        param_keys = list(encoding_data["param_encodings"].keys())
+        self.assertTrue(param_keys[2] == "conv1.weight")
+        self.assertTrue(isinstance(encoding_data["param_encodings"]["conv1.weight"], list))
+
+    
     # -------------------------------------------
 
     def test_export_to_onnx(self):
         """Exporting encodings and model"""
 
+        dummy_input = (torch.rand(32, 1, 28, 28), torch.rand(32, 1, 28, 28))
+
         def forward_pass(model, args):
             model.eval()
             with torch.no_grad():
-                model(torch.randn((32, 1, 28, 28)), torch.randn(32, 1, 28, 28))
+                model(*dummy_input)
 
         model = ModelWithTwoInputs()
-        sim = QuantizationSimModel(model, dummy_input=(torch.rand(32, 1, 28, 28), torch.rand(32, 1, 28, 28)))
+        sim = QuantizationSimModel(model, dummy_input=dummy_input)
 
         # Quantize
         sim.compute_encodings(forward_pass, None)
@@ -603,11 +703,22 @@ class TestQuantizationSim(unittest.TestCase):
         sim.model.conv1_a.output_quantizers[0].encoding.max = 30
 
         # save encodings
-        sim.export('./data/', 'two_input_model', input_shape=[(1, 1, 28, 28), (1, 1, 28, 28)])
+        sim.export('./data/', 'two_input_model', dummy_input)
 
         # check the encodings
         with open('./data/two_input_model.encodings', 'r') as fp:
             encodings = json.load(fp)
+
+            activation_encodings = encodings['activation_encodings']
+            param_encodings = encodings['param_encodings']
+            self.assertEqual(15, len(activation_encodings))
+            self.assertIn('conv1_a.bias', param_encodings)
+            self.assertEqual(param_encodings['conv1_a.bias'][0]['bitwidth'], 32)
+            self.assertEqual(6, len(param_encodings['conv1_a.weight'][0]))
+            self.assertEqual(10, param_encodings['conv1_a.weight'][0]['max'])
+
+        with open('./data/two_input_model.encodings.yaml', 'r') as fp_yaml:
+            encodings = yaml.load(fp_yaml, Loader=yaml.FullLoader)
 
             activation_encodings = encodings['activation_encodings']
             param_encodings = encodings['param_encodings']
@@ -684,7 +795,7 @@ class TestQuantizationSim(unittest.TestCase):
         print(sim.model.conv1.input_quantizer)
         print(sim.model.conv1.output_quantizers[0])
 
-    def test_quantizing_models_with_add_ops(self):
+    def test_quantizing_models_with_funtional_add_ops(self):
         """
         Testing models with add functional ops
         :return:
@@ -711,6 +822,7 @@ class TestQuantizationSim(unittest.TestCase):
 
                 ya = self.conv4a(x)
                 yb = self.conv4b(x)
+
                 x = ya + yb
                 x = self.conv5(x)
 
@@ -723,6 +835,51 @@ class TestQuantizationSim(unittest.TestCase):
 
         self.assertTrue(sim.model.conv3.input_quantizer.enabled)
         self.assertTrue(sim.model.conv5.input_quantizer.enabled)
+
+        print(sim)
+
+    def test_quantizing_models_with_module_add_ops(self):
+        """
+        Testing models with add functional ops
+        :return:
+        """
+        class Net(nn.Module):
+            def __init__(self):
+                super(Net, self).__init__()
+                self.conv1 = nn.Conv2d(3, 10, kernel_size=5)
+                self.conv2a = nn.Conv2d(10, 20, kernel_size=5)
+                self.conv2b = nn.Conv2d(10, 20, kernel_size=5)
+                self.conv3 = nn.Conv2d(20, 20, kernel_size=5)
+                self.conv4a = nn.Conv2d(20, 20, kernel_size=5)
+                self.conv4b = nn.Conv2d(20, 20, kernel_size=5)
+                self.conv5 = nn.Conv2d(20, 20, kernel_size=5)
+                self.add1 = elementwise_ops.Add()
+                self.add2 = elementwise_ops.Add()
+
+            def forward(self, input):
+                x = self.conv1(input)
+
+                ya = self.conv2a(x)
+                yb = self.conv2b(x)
+
+                x = self.add1(ya, yb)
+                x = self.conv3(x)
+
+                ya = self.conv4a(x)
+                yb = self.conv4b(x)
+
+                x = self.add2(ya, yb)
+                x = self.conv5(x)
+
+                return x
+
+        model = Net()
+        model(torch.rand(1, 3, 28, 28))
+        sim = QuantizationSimModel(model, quant_scheme=QuantScheme.post_training_tf,
+                                   dummy_input=torch.rand(1, 3, 28, 28))
+
+        self.assertFalse(sim.model.conv3.input_quantizer.enabled)
+        self.assertTrue(sim.model.add1.output_quantizer.enabled)
 
         print(sim)
 
@@ -984,14 +1141,16 @@ class TestQuantizationSim(unittest.TestCase):
     def test_with_standalone_ops(self):
 
         model = ModelWithStandaloneOps()
-        sim = QuantizationSimModel(model=model, dummy_input=torch.rand(1, 1, 28, 28))
+        dummy_input=torch.rand(1, 1, 28, 28)
+
+        sim = QuantizationSimModel(model=model, dummy_input=dummy_input)
 
         # Quantize
         sim.compute_encodings(dummy_forward_pass, None)
         dummy_forward_pass(sim.model, None)
 
         # Save encodings
-        sim.export("./data/", "encodings_with_standalone_ops", input_shape=(1, 1, 28, 28))
+        sim.export("./data/", "encodings_with_standalone_ops", dummy_input)
         with open('./data/encodings_with_standalone_ops.encodings') as json_file:
             encoding_data = json.load(json_file)
         # in onnx definition tensor 16 is output of Reshape, to be ignored
@@ -1143,12 +1302,11 @@ class TestQuantizationSim(unittest.TestCase):
         sim.compute_encodings(dummy_forward_pass, None)
         for name, module in sim.model.named_modules():
             if isinstance(module, QcPostTrainingWrapper):
+                self.assertEqual(QcQuantizeOpMode.ACTIVE, module._mode)
                 if name == 'relu1':
                     self.assertTrue(module.output_quantizers[0].enabled)
-                    self.assertEqual(QcQuantizeOpMode.ACTIVE, module._mode)
                 elif name in ['conv2', 'conv2_drop', 'relu2', 'relu3', 'dropout', 'fc2', 'log_softmax']:
-                    self.assertTrue(module.output_quantizers[0].enabled)
-                    self.assertEqual(QcQuantizeOpMode.PASSTHROUGH, module._mode)
+                    self.assertFalse(module.output_quantizers[0].enabled)
 
     def test_connected_graph_is_none(self):
         """ Test that an assertion is thrown when connected graph is not able to be built. """
@@ -1165,9 +1323,9 @@ class TestQuantizationSim(unittest.TestCase):
     def test_rnn_quantization(self):
         """ Test quantizing a model with rnn layer """
         model = SingleLayerRNNModel()
-        input_shape = (10, 1, 3)
+        dummy_input = torch.randn(10, 1, 3)
 
-        sim = QuantizationSimModel(model, input_shape)
+        sim = QuantizationSimModel(model, dummy_input)
         self.assertTrue(isinstance(sim.model.rnn, QcQuantizeRecurrent))
 
     def test_quantizing_qc_quantize_module(self):
@@ -1180,13 +1338,13 @@ class TestQuantizationSim(unittest.TestCase):
     def test_export_lstm_model(self):
         """ Test export functionality with lstm model """
         model = TwoLayerBidirectionalLstmModel()
-        input_shape = (10, 1, 3)
+        dummy_input = torch.randn(10, 1, 3)
 
-        sim = QuantizationSimModel(model, input_shape)
+        sim = QuantizationSimModel(model, dummy_input)
 
         def forward_pass(model, args):
             model.eval()
-            model(torch.randn(input_shape))
+            model(dummy_input)
 
         # Quantize
         sim.compute_encodings(forward_pass, None)
@@ -1198,7 +1356,7 @@ class TestQuantizationSim(unittest.TestCase):
         # Check that edited weight is different than original weight in module_to_quantize
         self.assertTrue(not torch.equal(edited_weight, sim.model.lstm.module_to_quantize.weight_ih_l0))
 
-        sim.export('./data', 'rnn_save', input_shape)
+        sim.export('./data', 'rnn_save', dummy_input)
         exported_model = torch.load('./data/rnn_save.pth')
 
         # Check that weight from quantized module was copied to original module successfully
@@ -1216,3 +1374,55 @@ class TestQuantizationSim(unittest.TestCase):
         os.remove('./data/rnn_save.pth')
         os.remove('./data/rnn_save.onnx')
         os.remove('./data/rnn_save.encodings')
+
+    def test_set_and_freeze_param_encoding(self):
+        """ Test set and freeze parameter encoding  """
+        conv1 = torch.nn.Conv2d(4, 4, 1)
+        quant_module = QcPostTrainingWrapper(conv1, weight_bw=8, activation_bw=8, round_mode='nearest',
+                                             quant_scheme=QuantScheme.post_training_tf_enhanced)
+
+        param_encodings = {'conv1.weight': [{'bitwidth': 4, 'is_symmetric': 'False', 'max': 0.3, 'min': -0.2,
+                                             'offset': -7.0, 'scale': 0.038}]}
+
+        quant_module.set_and_freeze_param_encoding('conv1', param_encodings)
+
+        self.assertEqual(quant_module.param_quantizers['weight'].encoding.bw, 4)
+        self.assertEqual(quant_module.param_quantizers['weight'].encoding.offset, -7.0)
+        self.assertEqual(quant_module.param_quantizers['weight'].encoding.delta, 0.038)
+        self.assertEqual(quant_module.param_quantizers['weight'].use_symmetric_encodings, False)
+        self.assertEqual(quant_module.param_quantizers['weight'].bitwidth, 4)
+
+        # Reset encoding, Since encoding are frozen they should not be None after reset encoding
+        quant_module.reset_encodings()
+
+        self.assertEqual(quant_module.param_quantizers['weight'].encoding.bw, 4)
+        self.assertEqual(quant_module.param_quantizers['weight'].encoding.offset, -7.0)
+        self.assertEqual(quant_module.param_quantizers['weight'].encoding.delta, 0.038)
+        self.assertEqual(quant_module.param_quantizers['weight'].use_symmetric_encodings, False)
+        self.assertEqual(quant_module.param_quantizers['weight'].bitwidth, 4)
+
+    def test_compute_encoding_with_given_bitwidth(self):
+        """
+        Test functionality to compute encoding for given bitwidth
+        """
+        encoding_dict = QuantizationSimModel.generate_symmetric_encoding_dict(
+            torch.as_tensor(np.array([1.203197181224823, 0], dtype='float32')),  bitwidth=32)
+        self.assertEqual(-2147483648, encoding_dict['offset'])
+        self.assertEqual(0, encoding_dict['min'])
+        self.assertAlmostEqual(encoding_dict['scale'], 5.6028e-10, places=14)
+
+        encoding_dict = QuantizationSimModel.generate_symmetric_encoding_dict(
+            torch.as_tensor(np.array([-1.203197181224823, 0], dtype='float32')), bitwidth=32)
+        self.assertEqual(-2147483648, encoding_dict['offset'])
+        self.assertEqual(0, encoding_dict['max'])
+        self.assertAlmostEqual(encoding_dict['scale'], 5.6028e-10, places=14)
+
+        encoding_dict = QuantizationSimModel.generate_symmetric_encoding_dict(
+            torch.as_tensor(np.array([0.7796169519533523, -0.9791506528745285], dtype='float32')), bitwidth=32)
+        self.assertEqual(-2147483648, encoding_dict['offset'])
+        self.assertAlmostEqual(encoding_dict['scale'], 4.5595e-10, places=14)
+
+        encoding_dict = QuantizationSimModel.generate_symmetric_encoding_dict(
+            torch.as_tensor(np.array([0.7796169519533523, -0.9791506528745285], dtype='float32')), bitwidth=8)
+        self.assertEqual(-128, encoding_dict['offset'])
+        self.assertAlmostEqual(encoding_dict['scale'], 0.0077098476, places=7)

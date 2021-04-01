@@ -45,9 +45,15 @@ import torch.nn
 import torch
 from torch.utils.data import DataLoader, Dataset
 from torchvision import datasets, transforms
+
+import libpymo
 from aimet_common.utils import AimetLogger
+from aimet_common.quantsim import calculate_delta_offset
+from aimet_common.defs import QuantScheme
 
 logger = AimetLogger.get_area_logger(AimetLogger.LogAreas.Utils)
+
+torch_integer_dtypes = [torch.int, torch.int8, torch.int16, torch.int32, torch.int64]
 
 
 class IterFirstX:
@@ -529,36 +535,6 @@ def get_ordered_lists_of_conv_fc(model: torch.nn.Module, input_shapes: Tuple) ->
     return module_list
 
 
-def get_reused_modules(model: torch.nn.Module, input_shapes: Tuple) -> List[Tuple[str, torch.nn.Module]]:
-    """
-    Identify modules which are used more than once in the model
-    :param model: Model to check for modules used more than once
-    :param input_shapes: Input shapes of the model
-    :return: List of tuples of name and module for modules in the model which are used more than once
-    """
-    module_set = set()
-    reused_modules_set = set()
-
-    def forward_hook(curr_module, _, _1):
-        """
-        Custom forward hook function to add modules to module_set and reused_module_set.
-        :param curr_module: Current module being traversed during forward pass.
-        :param _1: Unused param
-        """
-        if curr_module in module_set:
-            reused_modules_set.add(curr_module)
-        else:
-            module_set.add(curr_module)
-
-    run_hook_for_layers(model, input_shapes, forward_hook)
-
-    reused_modules_list = []
-    for name, module in model.named_modules():
-        if is_leaf_module(module) and module in reused_modules_set:
-            reused_modules_list.append((name, module))
-    return reused_modules_list
-
-
 def change_tensor_device_placement(tensor_data: Union[torch.tensor, List, Tuple], device: torch.device):
     """
     Change the tensor_data's device placement
@@ -588,7 +564,7 @@ def change_tensor_device_placement(tensor_data: Union[torch.tensor, List, Tuple]
     return tensor_data
 
 
-def find_num_output_tensors_per_module(model: torch.nn.Module, input_tensor) -> Dict:
+def find_num_inout_tensors_per_module(model: torch.nn.Module, input_tensor) -> Dict:
     """
     Returns a map of module -> number of output tensors, for all the children modules of the
     provided module
@@ -599,10 +575,106 @@ def find_num_output_tensors_per_module(model: torch.nn.Module, input_tensor) -> 
     :return: map of module -> number of output tensors
     """
 
-    num_outputs_map = {}
+    num_inout_map = {}
 
-    def record_num_outputs(module, _, outputs):
-        num_outputs_map[module] = len(outputs)
+    def record_num_outputs(module, inputs, outputs):
+        num_inputs = len(inputs) if not isinstance(inputs, torch.Tensor) else 1
+        num_outputs = len(outputs) if not isinstance(outputs, torch.Tensor) else 1
+        num_inout_map[module] = (num_inputs, num_outputs)
 
     run_hook_for_layers_with_given_input(model, input_tensor, record_num_outputs)
-    return num_outputs_map
+    return num_inout_map
+
+
+def create_encoding_from_dict(encoding_dict: dict) -> (libpymo.TfEncoding, bool):
+    """
+    Create encoding object from encoding dictionary
+    :param encoding_dict: Dictionary containing encodings
+    :return: Encoding object, is_symmetric
+    """
+    encoding = libpymo.TfEncoding()
+    encoding.bw = encoding_dict.get('bitwidth')
+    encoding.max = encoding_dict.get('max')
+    encoding.min = encoding_dict.get('min')
+    encoding.delta = encoding_dict.get('scale')
+    encoding.offset = encoding_dict.get('offset')
+    is_symmetric = eval(encoding_dict.get('is_symmetric'))  # pylint: disable=eval-used
+    return encoding, is_symmetric
+
+
+def create_encoding_dict(encoding: libpymo.TfEncoding, is_symmetric: bool) -> Union[Dict, None]:
+    """
+    Create encoding dictionary from encoding object
+    :param encoding: Encoding object
+    :param is_symmetric: Symmetric vs asymmetric boolean
+    :return: Encoding Dictionary
+    """
+    if encoding:
+        encoding_min, encoding_max, bw = encoding.min, encoding.max, encoding.bw
+        scale, offset = calculate_delta_offset(encoding_min, encoding_max, bw)
+        return {'min': encoding_min,
+                'max': encoding_max,
+                'scale': scale,
+                'offset': offset,
+                'bitwidth': bw,
+                'is_symmetric': str(is_symmetric)}
+    return None
+
+
+def compute_encoding_for_given_bitwidth(data: np.ndarray, bitwidth: int, quant_scheme: QuantScheme,
+                                        is_symmetric: bool) -> Dict:
+    """
+    Return encoding dictionary for given bitwidth
+    :param data: Numpy data
+    :param bitwidth: bitwidth (4-31) to use for quantizing data
+    :param quant_scheme: Quantization scheme
+    :param is_symmetric: True if symmetric encodings is used, False otherwise
+    :return: Encoding Dictionary
+    """
+    # Create Encodings Analyzer and collect statistical data to compute encodings
+    # Since the data is numpy array and on CPU memory, useCuda is False
+    encoding_analyzer = libpymo.EncodingAnalyzerForPython(quant_scheme)
+    encoding_analyzer.updateStats(data, False)
+
+    encoding, is_encoding_valid = encoding_analyzer.computeEncoding(bitwidth, is_symmetric, False, False)
+
+    if is_encoding_valid:
+        return {'min': encoding.min,
+                'max': encoding.max,
+                'scale': encoding.delta,
+                'offset': encoding.offset,
+                'bitwidth': encoding.bw,
+                'is_symmetric': str(is_symmetric)}
+
+    return {}
+
+
+def get_reused_modules(model: torch.nn.Module, model_input: Union[torch.Tensor, Tuple]) -> \
+        List[Tuple[str, torch.nn.Module]]:
+    """
+    Identify modules which are used more than once in the model
+    :param model: Model to check for modules used more than once
+    :param model_input: Input to the model
+    :return: List of tuples of name and module for modules in the model which are used more than once
+    """
+    module_set = set()
+    reused_modules_set = set()
+
+    def forward_hook(curr_module, _, _1):
+        """
+        Custom forward hook function to add modules to module_set and reused_module_set.
+        :param curr_module: Current module being traversed during forward pass.
+        :param _1: Unused param
+        """
+        if curr_module in module_set:
+            reused_modules_set.add(curr_module)
+        else:
+            module_set.add(curr_module)
+
+    run_hook_for_layers_with_given_input(model, model_input, forward_hook)
+
+    reused_modules_list = []
+    for name, module in model.named_modules():
+        if is_leaf_module(module) and module in reused_modules_set:
+            reused_modules_list.append((name, module))
+    return reused_modules_list

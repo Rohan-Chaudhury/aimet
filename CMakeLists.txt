@@ -42,11 +42,15 @@ project(aimet)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11 -O0 -ggdb -fPIC -D_GLIBCXX_USE_CXX11_ABI=0")
 set(AIMET_INSTALL_DIR ${CMAKE_BINARY_DIR}/staging/universal)
 
-set(AIMET_PYTHONPATH
-      "PYTHONPATH=${CMAKE_BINARY_DIR}/artifacts:${CMAKE_CURRENT_SOURCE_DIR}/TrainingExtensions/torch/src/python/:${CMAKE_CURRENT_SOURCE_DIR}/TrainingExtensions/tensorflow/src/python/:${CMAKE_CURRENT_SOURCE_DIR}/TrainingExtensions/common/src/python/" CACHE STRING "python path")
+if(NOT DEFINED AIMET_PYTHONPATH)
+  set(AIMET_PYTHONPATH "PYTHONPATH=${CMAKE_BINARY_DIR}/artifacts" CACHE STRING "python path")
+endif()
+set(AIMET_PYTHONPATH "${AIMET_PYTHONPATH}:${CMAKE_CURRENT_SOURCE_DIR}/TrainingExtensions/common/src/python")
 
-set(AIMET_LD_LIBRARY_PATH
-      "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/artifacts:$ENV{LD_LIBRARY_PATH}")
+if(NOT DEFINED AIMET_LD_LIBRARY_PATH)
+  set(AIMET_LD_LIBRARY_PATH "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/artifacts:$ENV{LD_LIBRARY_PATH}")
+  message(STATUS "Set ${AIMET_LD_LIBRARY_PATH} in ${CMAKE_CURRENT_SOURCE_DIR}")
+endif()
 
 # Set the software version from version.txt file (if not already set)
 if(NOT DEFINED SW_VERSION)
@@ -72,18 +76,13 @@ endif(NOT (DEFINED ENABLE_CUDA))
 
 if (ENABLE_CUDA)
   message("Compiling with CUDA enabled")
-  enable_language(CUDA)
-  set(CUDA_NVCC_FLAGS
-        -O3 -std=c++11 -I /usr/local -I /usr/local/cuda-10.0/include -x cu -Xcompiler -fPIC -D_GLIBCXX_USE_CXX11_ABI=0
 
-        -gencode arch=compute_35,code=sm_35
-        -gencode arch=compute_50,code=sm_50
-        -gencode arch=compute_52,code=sm_52
-        -gencode arch=compute_60,code=sm_60
-        -gencode arch=compute_61,code=sm_61
-        -gencode arch=compute_61,code=compute_61
-        -gencode arch=compute_70,code=compute_70
-     )
+  find_package(CUDAToolkit)
+  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES 52 60 61 70 72)
+  endif()
+
+  enable_language(CUDA)
 
 else(ENABLE_CUDA)
   message("Compiling with CUDA disabled")
@@ -106,6 +105,7 @@ if (NOT (DEFINED ENABLE_TORCH))
 endif(NOT (DEFINED ENABLE_TORCH))
 
 if (ENABLE_TORCH)
+  set(AIMET_PYTHONPATH "${AIMET_PYTHONPATH}:${CMAKE_CURRENT_SOURCE_DIR}/TrainingExtensions/torch/src/python")
   # If we enable PyTorch builds then use the pybind11 headers that are part of the torch pip install
   # So we don't have a version mismatch - between PyTorch custom C++ op code and PyMO
   list(APPEND PYBIND11_INC_DIRS "/usr/local/lib/python3.6/dist-packages/torch/include")
@@ -141,6 +141,7 @@ if (NOT (DEFINED ENABLE_TENSORFLOW))
 endif(NOT (DEFINED ENABLE_TENSORFLOW))
 
 if (ENABLE_TENSORFLOW)
+  set(AIMET_PYTHONPATH "${AIMET_PYTHONPATH}:${CMAKE_CURRENT_SOURCE_DIR}/TrainingExtensions/tensorflow/src/python")
   list(APPEND TENSORFLOW_INCLUDES "/usr/local/lib/python3.6/dist-packages/tensorflow_core/include")
   add_library(TensorFlow SHARED IMPORTED)
   set_target_properties(TensorFlow PROPERTIES
@@ -154,6 +155,14 @@ else (ENABLE_TENSORFLOW)
   message("AIMET TensorFlow build disabled")
 
 endif (ENABLE_TENSORFLOW)
+
+# Export PYTHONPATH to the parent cmake scope (if present)
+get_directory_property(hasParent PARENT_DIRECTORY)
+if(hasParent)
+  set(AIMET_PYTHONPATH "${AIMET_PYTHONPATH}" PARENT_SCOPE)
+else()
+  message(STATUS "Set ${AIMET_PYTHONPATH} in ${CMAKE_CURRENT_SOURCE_DIR}")
+endif()
 
 # -------------------------------
 # Generate pip packages
@@ -181,7 +190,7 @@ if(NOT remote_url STREQUAL "")
     # Run the install target first
     COMMAND "${CMAKE_COMMAND}" --build . --target install
     # Now run the packaging target to generate wheel files
-    COMMAND ${CMAKE_COMMAND} -DAIMET_PACKAGE_PATH=${AIMET_PACKAGE_PATH} -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR} -P ${CMAKE_CURRENT_SOURCE_DIR}/packaging/package_aimet.cmake
+    COMMAND ${CMAKE_COMMAND} -DAIMET_PACKAGE_PATH=${AIMET_PACKAGE_PATH} -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR} -DENABLE_TENSORFLOW=${ENABLE_TENSORFLOW} -DENABLE_TORCH=${ENABLE_TORCH} -P ${CMAKE_CURRENT_SOURCE_DIR}/packaging/package_aimet.cmake
   )
 else()
   message(STATUS "Repo Remote URL is blank. Skipping packageaimet target")

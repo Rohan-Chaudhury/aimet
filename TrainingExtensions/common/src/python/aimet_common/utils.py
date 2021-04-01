@@ -43,12 +43,13 @@ import os
 import logging
 import logging.config
 import logging.handlers
-import json
 import signal
 import socket
 import subprocess
 import time
 from enum import Enum
+import json
+import yaml
 
 try:
     # The build system updates Product, Version and Feature set information in the package_info file.
@@ -124,7 +125,9 @@ class AimetLogger(metaclass=SingletonType):
         logging.config.dictConfig(config_dict)
 
         # Validate JSON  file default_logging_config.json for correct Logging Areas
-        configured_items = list(logging.root.manager.loggerDict.items())
+        #TODO This results in a pylint error: Instance of 'RootLogger' has no 'loggerDict' member.
+        # Need to fix this issue and then remove the pylint disablement.
+        configured_items = list(logging.root.manager.loggerDict.items()) # pylint: disable=no-member
 
         log_areas_list = list()
         for x in AimetLogger.LogAreas:
@@ -249,3 +252,17 @@ def log_package_info():
         # If Version is empty, the Postfix is not logged.
         # Log Product.
         logging.info("%s", Product)
+
+
+def save_json_yaml(encoding_file_path: str, encodings_dict: dict):
+    """
+    Function which saves encoding in YAML and JSON file format
+    :param encoding_file_path: file name to use to generate the yaml and json file
+    :param encodings_dict: dictionary containing the encoding
+    """
+    encoding_file_path_json = encoding_file_path
+    encoding_file_path_yaml = encoding_file_path + '.yaml'
+    with open(encoding_file_path_json, 'w') as encoding_fp_json:
+        json.dump(encodings_dict, encoding_fp_json, sort_keys=True, indent=4)
+    with open(encoding_file_path_yaml, 'w') as encoding_fp_yaml:
+        yaml.dump(encodings_dict, encoding_fp_yaml, default_flow_style=False, allow_unicode=True)
